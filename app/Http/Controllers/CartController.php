@@ -12,7 +12,7 @@ class CartController extends Controller
 {
     public function storeOrder(Request $request)
 {
-    // Step 1: Validate the request
+    // Step 1: Validate input
     $validator = Validator::make($request->all(), [
         'name'             => 'required|string|max:255',
         'phone'            => 'required|string|max:15',
@@ -26,7 +26,7 @@ class CartController extends Controller
         'cart.*.price'     => 'required|numeric|min:0',
         'cart.*.quantity'  => 'required|integer|min:1',
     ]);
- 
+
     if ($validator->fails()) {
         return response()->json([
             'status'  => 'error',
@@ -34,10 +34,10 @@ class CartController extends Controller
             'errors'  => $validator->errors()
         ], 422);
     }
- 
+
     $validated = $validator->validated();
- 
-    // Step 2: Create the order
+
+    // Step 2: Create customer order
     $order = CustOrderInfo::create([
         'name'            => $validated['name'],
         'phone'           => $validated['phone'],
@@ -48,37 +48,42 @@ class CartController extends Controller
         'pincode'         => $validated['type'] === 'delivery' ? ($validated['pincode'] ?? null) : null,
         'address'         => $validated['type'] === 'delivery' ? ($validated['address'] ?? null) : null,
     ]);
- 
-    // Step 3: Loop through cart items
+
+    // Step 3: Save each cart item with GST
     $totalAmount = 0;
- 
+
     foreach ($validated['cart'] as $item) {
         $menuItem = MenuInfo::where('name', $item['name'])->first();
- 
+
         if ($menuItem) {
-            $itemTotal = $item['quantity'] * $menuItem->price;
+            $basePrice = $menuItem->price * $item['quantity'];
+            $gst = $basePrice * 0.05; // 5% GST
+            $itemTotal = $basePrice + $gst;
             $totalAmount += $itemTotal;
- 
+
             OrderInfo::create([
-                'cust_id'  => $order->id,
-                'order_id' => $menuItem->id,
-                'qty'      => $item['quantity'],
+                'cust_id'   => $order->id,
+                'order_id'  => $menuItem->id,
+                'qty'       => $item['quantity'],
+                // Optionally, add columns for price and gst in your table:
+                // 'price'     => $menuItem->price,
+                // 'gst'       => $gst,
             ]);
         }
     }
- 
-    // Step 4: Update total
-    $order->update(['total' => $totalAmount]);
- 
-    // Step 5: Respond back
+
+    // Step 4: Update order total
+    $order->update(['total' => round($totalAmount, 2)]);
+
+    // Step 5: Respond
     return response()->json([
         'status'   => 'success',
         'message'  => 'Order placed successfully!',
         'order_id' => $order->id,
-        'total'    => $totalAmount
+        'total'    => round($totalAmount, 2)
     ], 201);
 }
- 
+
  
 }
  

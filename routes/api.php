@@ -17,11 +17,14 @@ use App\Http\Controllers\AdminCustomerDetail;
 use App\Http\Controllers\UserController;
 use App\Http\Controllers\Api\CheckoutApiController;
 use App\Http\Controllers\Api\ApiStaffController;
+use App\Http\Controllers\OfflineReservation;
 use App\Http\Controllers\TableController;
 use App\Http\Controllers\TableReservationController;
 use App\Http\Controllers\ReviewController;
 use App\Http\Controllers\CartController;
 use Illuminate\Support\Facades\Auth;
+
+
 
 
 
@@ -107,10 +110,10 @@ Route::post('/signup',[AuthController::class, 'signup']);
 Route::post('/login',[AuthController::class, 'login']);
 Route::post('/verify-otp',[AuthController::class, 'otp']);
 Route::post('/send-otp',[AuthController::class, 'otp']);
-Route::get('/tableinfo', [TableController::class, 'tableinfo']);
+// Route::get('/tableinfo', [TableController::class, 'tableinfo']);
 
-Route::post('reservationdetails', [ReservationController::class, 'reservationdetails']);
- 
+Route::post('/reservationdetails', [ReservationController::class, 'reservationdetails']);
+
 
 
 // Route::middleware('auth:sanctum')->group(function() {
@@ -159,5 +162,5 @@ Route::post('/placeorder',[CartController::class,'storeorder']);
 // Route::get('/admin/revenue', [RevenueController::class, 'index'])->name('api.admin.revenue');
 
 
-Route::post('/admin/offline_reservation',[TableController::class, 'getAvailableOfflineTables']);
-Route::post('/admin/offlinereservation',[TableController::class, 'storeOfflineReservation']);
+Route::post('/admin/offlinereservation', [OfflineReservation::class, 'checkAvailability']);
+Route::post('/admin/offlinereservationsave', [OfflineReservation::class, 'saveOfflineReservation']);

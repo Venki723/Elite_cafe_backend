@@ -1,13 +1,14 @@
 <?php
- 
+
 namespace App\Models;
- 
+
 use Illuminate\Database\Eloquent\Model;
- 
+use App\Models\OrderItem;
+
 class CustOrderInfo extends Model
 {
-    protected $table = 'orders'; // Optional if table name matches plural of model name
- 
+    protected $table = 'orders';
+
     protected $fillable = [
         'id',
         'customer_email',
@@ -21,12 +22,17 @@ class CustOrderInfo extends Model
         'locality',
         'address',
     ];
- 
-    // If you want Laravel to treat `created_at` and `updated_at` as Carbon instances
+
     protected $dates = [
         'created_at',
         'updated_at',
     ];
+
+    // ✅ Add this to define the relationship to OrderItem
+public function orderItems()
+{
+    return $this->hasMany(OrderItem::class, 'cust_id', 'id');
 }
- 
- 
+
+
+}

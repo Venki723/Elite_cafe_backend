@@ -32,6 +32,7 @@ class Reservation extends Model
         'message',
         'actual_arrival_time',
         'actual_persons_arrived',
+        'type',
     ];
  
     protected $casts = [

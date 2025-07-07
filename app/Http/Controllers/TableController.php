@@ -10,19 +10,14 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Collection;
 
 class TableController extends Controller
 {
-    // Define constants for better maintainability and readability
-    const RESERVATION_SLOT_DURATION_MINUTES = 60; // Duration of a single reservation slot in minutes
-    const MAX_STAFF_ASSIGNMENTS_PER_SLOT = 3;     // Max tables a staff member can be assigned to per slot
-    const MAX_TABLES_IN_COMBO = 4;                // Maximum number of tables allowed in a single combination for a reservation
-
     /**
-     * Handles the reservation details submission, finds available tables,
-     * creates a reservation, and assigns staff.
+     * Handles the creation of a new reservation, including table and staff assignment.
      *
-     * @param Request $request
+     * @param Request $request The incoming HTTP request containing reservation details.
      * @return \Illuminate\Http\JsonResponse
      */
     public function reservationdetails(Request $request)
@@ -33,48 +28,79 @@ class TableController extends Controller
             'last_name'         => 'required|string|max:300',
             'email'             => 'required|email|max:200',
             'phone_number'      => 'required|digits:10',
-            'persons'           => 'required|string|max:10', // Changed to string as it's cast to int later
-            'reservation_date'  => 'required|date',
+            'persons'           => 'required|integer|min:1|max:100',
+            'reservation_date'  => 'required|date_format:Y-m-d|after_or_equal:today',
             'reservation_time'  => 'required|date_format:H:i',
             'message'           => 'nullable|string|max:300',
+            'booking_type'      => 'required|in:online,offline', // Added to differentiate booking types
         ]);
 
-        // 2. Prepare reservation details
-        $bookedPersons = (int)$validated['persons'];
+        $bookedPersons = $validated['persons'];
         $reservationDate = $validated['reservation_date'];
         $reservationTime = $validated['reservation_time'];
+        $bookingType = $validated['booking_type']; // Get the booking type
+        $slotDurationMinutes = 60; // Standard reservation slot duration
 
-        // Calculate reservation start and end times based on the slot duration
         $startDateTime = Carbon::parse($reservationDate . ' ' . $reservationTime);
-        $endDateTime = $startDateTime->copy()->addMinutes(self::RESERVATION_SLOT_DURATION_MINUTES);
+        $endDateTime = $startDateTime->copy()->addMinutes($slotDurationMinutes);
 
-        // 3. Prevent booking for past times on the current day
-        if ($startDateTime->isToday() && $startDateTime->lt(Carbon::now())) {
+        // 2. Prevent booking for past times on the current day
+        if ($startDateTime->isToday() && $startDateTime->lt(Carbon::now(config('app.timezone')))) {
             return response()->json([
-                'status' => 'error',
-                'message' => 'Cannot book for a past time today. Please select a future time.',
+                'status'  => 'error',
+                'message' => 'Cannot book for a past time today. Please choose a future time.',
             ], 400);
         }
 
-        // 4. Find available table combinations
-        // 4. Find available table combinations
-$assignedTables = $this->findTableCombinations($bookedPersons, $startDateTime, $endDateTime);
+        // --- Specific Capacity 2 Table Limit Check for 'online' booking type ---
+        // This check is specific to online bookings for capacity 2 tables
+        $capacity2Limit = 3;
+        if ($bookingType === 'online' && $bookedPersons <= 2) {
+            $currentlyBookedCapacity2OnlineTables = Reservation::where(function ($q) use ($startDateTime, $endDateTime) {
+                    $q->where('reserved_from', '<', $endDateTime)
+                      ->where('reserved_to', '>', $startDateTime);
+                })
+                ->whereHas('tables', function ($q) {
+                    $q->where('capacity', 2)
+                      ->where('table_type', 'online'); // Ensure we count only online tables
+                })
+                ->count();
 
-// If no tables are found, return an error response
-if (empty($assignedTables)) {
-    return response()->json([
-        'status' => 'error',
-        'message' => 'Sorry, no available online tables for ' . $bookedPersons . ' guests at ' .
-                     $startDateTime->format('h:i A') . ' on ' . $reservationDate . '. Please try a different time or date.',
-    ], 400);
-}
+            if ($currentlyBookedCapacity2OnlineTables >= $capacity2Limit) {
+                return response()->json([
+                    'status'  => 'error',
+                    'message' => 'Please choose the next slot, all online tables of capacity 2 are booked for ' .
+                                 $startDateTime->format('h:i A') . ' on ' . $reservationDate . '.',
+                ], 400);
+            }
+        }
+        // --- END Specific Capacity 2 Table Limit Check ---
 
 
-        // 5. Start database transaction for atomicity
+        // 3. Find available table combinations, passing the booking type
+        $assignedTables = $this->findTableCombinations($bookedPersons, $startDateTime, $endDateTime, $bookingType);
+
+        if (empty($assignedTables)) {
+            $message = 'Sorry, no suitable tables are available for ' . $bookedPersons . ' guests at ' .
+                       $startDateTime->format('h:i A') . ' on ' . $reservationDate . '. Please try another time slot or fewer guests.';
+
+            // Optional: More specific message for offline bookings if no tables are found
+            if ($bookingType === 'offline') {
+                $message = 'Sorry, no offline tables or unbooked online tables are available for ' . $bookedPersons . ' guests at ' .
+                           $startDateTime->format('h:i A') . ' on ' . $reservationDate . '. Please try another time slot.';
+            }
+
+            return response()->json([
+                'status'  => 'error',
+                'message' => $message,
+            ], 400);
+        }
+
+        // Start database transaction for atomicity (all or nothing)
         DB::beginTransaction();
 
         try {
-            // 6. Create the new reservation record
+            // 4. Create the reservation record
             $reservation = Reservation::create([
                 'first_name'        => $validated['first_name'],
                 'last_name'         => $validated['last_name'],
@@ -85,243 +111,278 @@ if (empty($assignedTables)) {
                 'reservation_time'  => $startDateTime->format('H:i:s'),
                 'reserved_from'     => $startDateTime,
                 'reserved_to'       => $endDateTime,
-                'status'            => 'confirmed', // Default status
+                'status'            => 'confirmed',
                 'message'           => $validated['message'],
+                'booking_type'      => $bookingType, // Store the booking type in the reservation
             ]);
 
-            // 7. Attach the assigned tables to the reservation
-            // Using pluck('id') to get an array of table IDs for the many-to-many relationship
+            // 5. Attach assigned tables to the reservation via the pivot table
             $reservation->tables()->attach(collect($assignedTables)->pluck('id'));
 
-            // 8. Assign staff to each reserved table
+            // 6. Staff Assignment Logic (remains largely the same)
+            $staffAssignmentsToCreate = [];
+            $assignedStaffIdsCurrentReservation = [
+                'Waiter' => [], 'Manager' => [], 'Cleaner' => [],
+            ];
+            $maxTablesPerStaff = 3;
+
             foreach ($assignedTables as $table) {
-                $assignedStaffForTable = []; // To hold the assigned staff for the current table
-
-                // Iterate through required staff roles
+                $currentTableAssignedStaff = [];
                 foreach (['Waiter', 'Manager', 'Cleaner'] as $role) {
-                    $roleColumn = strtolower($role) . '_id'; // e.g., 'waiter_id'
+                    $roleColumn = strtolower($role) . '_id';
 
-                    // Find a staff member for the current role who is not assigned to too many tables
                     $staff = Staff::where('role', $role)
-                        ->whereNotIn('staff_id', function ($query) use ($roleColumn, $reservationDate, $reservationTime) {
+                        ->whereNotIn('staff_id', function ($query) use ($reservationDate, $reservationTime, $roleColumn, $maxTablesPerStaff) {
                             $query->select($roleColumn)
                                 ->from('staff_table_assignments')
                                 ->where('assignment_date', $reservationDate)
                                 ->where('assignment_time', $reservationTime)
+                                ->whereNotNull($roleColumn)
                                 ->groupBy($roleColumn)
-                                ->havingRaw('COUNT(*) >= ' . self::MAX_STAFF_ASSIGNMENTS_PER_SLOT);
+                                ->havingRaw("COUNT({$roleColumn}) >= ?", [$maxTablesPerStaff]);
                         })
-                        ->inRandomOrder() // Pick a random available staff member
+                        ->whereNotIn('staff_id', $assignedStaffIdsCurrentReservation[$role])
+                        ->inRandomOrder()
                         ->first();
 
-                    $assignedStaffForTable[$role] = $staff;
+                    if ($staff) {
+                        $currentTableAssignedStaff[$role] = $staff->staff_id;
+                        $assignedStaffIdsCurrentReservation[$role][] = $staff->staff_id;
+                    } else {
+                        Log::warning("Could not find an available {$role} for table ID: {$table->id} at {$reservationDate} {$reservationTime}.");
+                        DB::rollBack();
+                        return response()->json([
+                            'status'  => 'error',
+                            'message' => "Sorry, we couldn't assign enough staff for your reservation (e.g., no available {$role}). Please try a different time or fewer guests.",
+                        ], 500);
+                    }
                 }
 
-                // Only create a staff assignment record if all three roles are successfully found
-                // Note: If a staff member for a role isn't found, this table's assignment will be skipped.
-                // Consider business logic: should the reservation fail if staff can't be fully assigned?
-                if ($assignedStaffForTable['Waiter'] && $assignedStaffForTable['Manager'] && $assignedStaffForTable['Cleaner']) {
-                    StaffTableAssignment::create([
+                if (isset($currentTableAssignedStaff['Waiter'], $currentTableAssignedStaff['Manager'], $currentTableAssignedStaff['Cleaner'])) {
+                    $staffAssignmentsToCreate[] = [
                         'table_id'          => $table->id,
                         'assignment_date'   => $reservationDate,
                         'assignment_time'   => $reservationTime,
-                        'waiter_id'         => $assignedStaffForTable['Waiter']->staff_id,
-                        'manager_id'        => $assignedStaffForTable['Manager']->staff_id,
-                        'cleaner_id'        => $assignedStaffForTable['Cleaner']->staff_id,
-                    ]);
-                } else {
-                    Log::warning("Could not assign all staff roles for table ID: {$table->id} at {$reservationDate} {$reservationTime}.");
+                        'waiter_id'         => $currentTableAssignedStaff['Waiter'],
+                        'manager_id'        => $currentTableAssignedStaff['Manager'],
+                        'cleaner_id'        => $currentTableAssignedStaff['Cleaner'],
+                        'created_at'        => now(),
+                        'updated_at'        => now(),
+                    ];
                 }
             }
 
-            // 9. Commit the transaction if all operations are successful
+            if (!empty($staffAssignmentsToCreate)) {
+                StaffTableAssignment::insert($staffAssignmentsToCreate);
+            } else {
+                Log::error("No staff assignments could be prepared for insertion after table assignment. Check staff availability and assignment logic.");
+                DB::rollBack();
+                return response()->json([
+                    'status'  => 'error',
+                    'message' => 'Failed to finalize staff assignments. Please contact support.',
+                ], 500);
+            }
+
+            // 7. Commit the entire transaction
             DB::commit();
 
-            // 10. Prepare response data
+            // 8. Prepare response data for the client
             $assignedTableNames = collect($assignedTables)->pluck('name')->implode(', ');
             $totalCapacity = collect($assignedTables)->sum('capacity');
-            $assignedTableIds = collect($assignedTables)->pluck('id');
 
-            // Fetch staff assignments with their details for the response
+            $assignedTableIdsForResponse = collect($assignedTables)->pluck('id')->toArray();
             $staffAssignments = StaffTableAssignment::with(['waiter', 'manager', 'cleaner'])
-                ->whereIn('table_id', $assignedTableIds)
+                ->whereIn('table_id', $assignedTableIdsForResponse)
                 ->where('assignment_date', $reservationDate)
                 ->where('assignment_time', $reservationTime)
                 ->get();
 
-            // Group staff details to avoid duplicates and show assigned tables
             $staffDetails = [];
             foreach ($staffAssignments as $assignment) {
                 foreach (['waiter', 'manager', 'cleaner'] as $role) {
                     $staffMember = $assignment->$role;
                     if ($staffMember) {
-                        $staffDetails[$staffMember->staff_id]['staff_id'] = $staffMember->staff_id;
-                        $staffDetails[$staffMember->staff_id]['name'] = $staffMember->first_name . ' ' . $staffMember->last_name;
-                        $staffDetails[$staffMember->staff_id]['role'] = $staffMember->role;
-                        // Ensure assigned_tables_ids is an array before pushing
-                        if (!isset($staffDetails[$staffMember->staff_id]['assigned_tables_ids'])) {
-                            $staffDetails[$staffMember->staff_id]['assigned_tables_ids'] = [];
+                        if (!isset($staffDetails[$staffMember->staff_id])) {
+                            $staffDetails[$staffMember->staff_id] = [
+                                'staff_id' => $staffMember->staff_id,
+                                'name' => $staffMember->first_name . ' ' . $staffMember->last_name,
+                                'role' => $staffMember->role,
+                                'assigned_tables_ids' => []
+                            ];
                         }
-                        $staffDetails[$staffMember->staff_id]['assigned_tables_ids'][] = $assignment->table_id;
+                        if (!in_array($assignment->table_id, $staffDetails[$staffMember->staff_id]['assigned_tables_ids'])) {
+                            $staffDetails[$staffMember->staff_id]['assigned_tables_ids'][] = $assignment->table_id;
+                        }
                     }
                 }
             }
 
-            // Convert associative array to indexed array and ensure unique table IDs
             $groupedStaffDetails = array_values(array_map(function ($s) {
                 $s['assigned_tables_ids'] = array_values(array_unique($s['assigned_tables_ids']));
                 return $s;
             }, $staffDetails));
 
-            // 11. Return success response
+            // 9. Return success response with all relevant booking details
             return response()->json([
                 'status'                    => 'success',
                 'message'                   => 'Reservation successfully created for ' . $bookedPersons . ' guests.',
                 'data'                      => $reservation,
                 'assigned_tables'           => collect($assignedTables)->map(function ($table) {
-                    return ['id' => $table->id, 'name' => $table->name, 'capacity' => $table->capacity];
+                    return ['id' => $table->id, 'name' => trim($table->name), 'capacity' => $table->capacity];
                 }),
-                'assigned_table_names'      => $assignedTableNames,
+                'assigned_table_names'      => trim($assignedTableNames),
                 'total_assigned_capacity'   => $totalCapacity,
                 'assigned_staff'            => $groupedStaffDetails,
             ], 201);
 
         } catch (\Exception $e) {
-            // 12. Rollback transaction on error and log the exception
             DB::rollBack();
-            Log::error('Reservation failed: ' . $e->getMessage(), ['exception' => $e, 'request' => $request->all()]);
+            Log::error('Reservation failed: ' . $e->getMessage(), ['exception' => $e, 'trace' => $e->getTraceAsString()]);
 
-            // Return error response
             return response()->json([
-                'status' => 'error',
-                'message' => 'A server error occurred during reservation. Please try again or contact support.',
-                'error' => $e->getMessage() // Include error message for debugging in development
+                'status'  => 'error',
+                'message' => 'An unexpected server error occurred during reservation. Please try again or contact support.',
+                'error'   => $e->getMessage()
             ], 500);
         }
     }
 
     /**
-     * Finds the best combination of available 'online' tables for a given number of persons
-     * and reservation time slot.
+     * Finds the best combination of available tables for the given number of persons
+     * and time slot, respecting capacity limits and considering online-to-offline shift.
      *
-     * Prioritizes a single table if exact fit, then combinations with minimal excess capacity
-     * and fewest tables.
-     *
-     * @param int $targetPersons The number of guests for the reservation.
-     * @param Carbon $startDateTime The start time of the reservation.
-     * @param Carbon $endDateTime The end time of the reservation.
-     * @return array An array of RestaurantTable models representing the assigned tables.
+     * @param int $targetPersons The number of persons for the reservation.
+     * @param Carbon $startDateTime The start time of the reservation slot.
+     * @param Carbon $endDateTime The end time of the reservation slot.
+     * @param string $bookingType The type of booking ('online' or 'offline').
+     * @return array A list of RestaurantTable models representing the best combination found.
      */
-    protected function findTableCombinations(int $targetPersons, Carbon $startDateTime, Carbon $endDateTime): array
-{
-    // Fetch all 'online' tables, ordered by capacity for efficient searching
-    $allTables = RestaurantTable::where('table_type', 'online')->orderBy('capacity')->get();
+    protected function findTableCombinations(int $targetPersons, Carbon $startDateTime, Carbon $endDateTime, string $bookingType): array
+    {
+        // Define capacity limits for online reservations for specific table capacities.
+        $capacityLimits = [
+            2 => 3, // Max 3 tables of capacity 2 are available for online booking
+            4 => 6, // Max 6 tables of capacity 4 are available for online booking
+            6 => 2, // Example: Max 2 tables of capacity 6 are available online
+        ];
 
-    // Separate 2-seaters and 4-seaters for specific logic
-    $twoSeaters = $allTables->where('capacity', 2)->values();
-    $fourSeaters = $allTables->where('capacity', 4)->values();
+        // Get all tables that are currently booked for the given time slot, regardless of type
+        $bookedTableIdsForSlot = Reservation::where(function ($q) use ($startDateTime, $endDateTime) {
+                $q->where('reserved_from', '<', $endDateTime)
+                  ->where('reserved_to', '>', $startDateTime);
+            })
+            ->where('status', 'confirmed') // Only consider confirmed bookings
+            ->with('tables')
+            ->get()
+            ->flatMap(fn ($reservation) => $reservation->tables->pluck('id'))
+            ->unique()
+            ->toArray();
 
-    // Reusable closure to check if a table is available for the given time slot
-    $isAvailable = function ($table) use ($startDateTime, $endDateTime) {
-        return !Reservation::whereHas('tables', function ($q) use ($table) {
-            $q->where('restaurant_table_id', $table->id);
-        })
-        ->where(function ($q) use ($startDateTime, $endDateTime) {
-            // Check for overlapping reservations:
-            // Reservation starts before our end time AND
-            // Reservation ends after our start time
-            $q->where('reserved_from', '<', $endDateTime)
-              ->where('reserved_to', '>', $startDateTime);
-        })
-        ->exists();
-    };
+        $allAvailableTables = new Collection();
 
-    // Case 1: Exactly 2 guests - try to find a single 2-seater
-    if ($targetPersons === 2) {
-        foreach ($twoSeaters as $table) {
-            if ($isAvailable($table)) {
-                return [$table]; // Found an available 2-seater
+        // 1. Add explicitly 'offline' tables to the pool
+        if ($bookingType === 'offline') {
+            $offlineTables = RestaurantTable::where('table_type', 'offline')
+                                            ->whereNotIn('id', $bookedTableIdsForSlot)
+                                            ->get();
+            $allAvailableTables = $allAvailableTables->merge($offlineTables);
+        }
+
+        // 2. Add 'online' tables that are not booked and are available within their limits
+        //    For offline bookings, also consider online tables if current time is close to slot.
+        $currentTime = Carbon::now(config('app.timezone'));
+        $thresholdTime = $startDateTime->copy()->subMinutes(10); // 10 minutes before the slot, convert online to offline
+
+        foreach ($capacityLimits as $capacity => $limit) {
+            // Count how many online tables of this capacity are already booked for this slot
+            $onlineTablesBookedCount = Reservation::where(function ($q) use ($startDateTime, $endDateTime) {
+                    $q->where('reserved_from', '<', $endDateTime)
+                      ->where('reserved_to', '>', $startDateTime);
+                })
+                ->whereHas('tables', function ($q) use ($capacity) {
+                    $q->where('capacity', $capacity)
+                      ->where('table_type', 'online');
+                })
+                ->count();
+
+            $availableOnlineSlotsInLimit = $limit - $onlineTablesBookedCount;
+
+            if ($availableOnlineSlotsInLimit > 0) {
+                // Fetch online tables that are not booked and within their global capacity limit
+                $onlineTablesToConsider = RestaurantTable::where('capacity', $capacity)
+                    ->where('table_type', 'online')
+                    ->whereNotIn('id', $bookedTableIdsForSlot) // Exclude tables already booked by anyone (online/offline)
+                    ->orderBy('id')
+                    ->get(); // Get all potentially available online tables
+
+                // Now apply the limit based on booking type
+                if ($bookingType === 'online') {
+                    // For online bookings, strictly adhere to the defined capacity limit
+                    $onlineTablesToConsider = $onlineTablesToConsider->take($availableOnlineSlotsInLimit);
+                    $allAvailableTables = $allAvailableTables->merge($onlineTablesToConsider);
+                } elseif ($bookingType === 'offline' && $currentTime->gte($thresholdTime) && $startDateTime->isSameDay($currentTime)) {
+                    // For offline bookings, AND if current time is near the slot, consider ALL unbooked online tables
+                    // that were originally "online" type and not booked.
+                    // This is the core of the "shifting" logic.
+                    $allAvailableTables = $allAvailableTables->merge($onlineTablesToConsider);
+                }
             }
         }
-        return []; // No 2-seater available
-    }
 
-    // Case 2: Exactly 4 guests - prefer a single 4-seater, fallback to two 2-seaters
-    elseif ($targetPersons === 4) {
-        foreach ($fourSeaters as $table) {
-            if ($isAvailable($table)) {
-                return [$table]; // Found an available 4-seater
-            }
-        }
+        // Sort tables by capacity ascending for efficient combination search
+        $allAvailableTables = $allAvailableTables->sortBy('capacity')->values();
 
-        // If no 4-seater, try to combine two 2-seaters
-        $availableTwos = $twoSeaters->filter($isAvailable)->values();
-        if ($availableTwos->count() >= 2) {
-            return [$availableTwos[0], $availableTwos[1]]; // Use the first two available 2-seaters
-        }
-
-        return []; // No 4-seater or two 2-seaters available
-    }
-
-    // Case 3: For all other guest counts (3, 5, 6, 7+, etc.)
-    else {
-        // Filter all tables to get only the ones currently available
-        $availableTables = $allTables->filter($isAvailable)->values();
-
-        $bestCombo = [];
-        $minCapacity = PHP_INT_MAX;
+        $bestCombination = [];
+        $minTotalCapacityDifference = PHP_INT_MAX;
         $minTableCount = PHP_INT_MAX;
 
-        $totalTables = $availableTables->count();
+        // Recursive function to find the best table combination
+        $findCombinations = function ($index, $currentCapacity, $currentCombination)
+            use (
+                &$findCombinations, $allAvailableTables, $targetPersons,
+                &$bestCombination, &$minTotalCapacityDifference, &$minTableCount
+            ) {
+            $currentTableCount = count($currentCombination);
+            $currentCapacityDifference = $currentCapacity - $targetPersons;
 
-        // Recursive function to find the optimal table combination
-        $findCombo = function (
-            int $index,
-            array $currCombo,
-            int $currCapacity
-        ) use (
-            &$findCombo, $availableTables, $targetPersons,
-            &$bestCombo, &$minCapacity, &$minTableCount, $totalTables
-        ) {
-            // Base Case 1: If current capacity meets or exceeds target persons
-            if ($currCapacity >= $targetPersons) {
-                // Check if this combination is better than the current best
-                if (
-                    $currCapacity < $minCapacity ||
-                    ($currCapacity === $minCapacity && count($currCombo) < $minTableCount)
-                ) {
-                    $bestCombo = $currCombo;
-                    $minCapacity = $currCapacity;
-                    $minTableCount = count($currCombo);
+            // If we have met or exceeded the target persons
+            if ($currentCapacity >= $targetPersons) {
+                // Check if this combination is better than the current best found
+                if ($currentCapacityDifference < $minTotalCapacityDifference ||
+                    ($currentCapacityDifference === $minTotalCapacityDifference && $currentTableCount < $minTableCount)) {
+                    $bestCombination = $currentCombination;
+                    $minTotalCapacityDifference = $currentCapacityDifference;
+                    $minTableCount = $currentTableCount;
                 }
-                return; // Stop exploring this path
-            }
-
-            // Base Case 2: If no more tables to consider OR combo has too many tables
-            if ($index >= $totalTables || count($currCombo) >= self::MAX_TABLES_IN_COMBO) {
                 return;
             }
 
-            // Recursive Step 1: Include the current table
-            $findCombo(
-                $index + 1,
-                array_merge($currCombo, [$availableTables[$index]]),
-                $currCapacity + $availableTables[$index]->capacity
-            );
+            // Base case: If we've iterated through all available tables, stop this recursive branch.
+            if ($index >= $allAvailableTables->count()) {
+                return;
+            }
 
-            // Recursive Step 2: Exclude the current table
-            $findCombo(
+            $table = $allAvailableTables[$index];
+
+            // Option 1: Include the current table in the combination
+            if ($currentTableCount < 4) { // General limit on number of tables in a combination
+                $findCombinations(
+                    $index + 1,
+                    $currentCapacity + $table->capacity,
+                    array_merge($currentCombination, [$table])
+                );
+            }
+
+            // Option 2: Exclude the current table from the combination and try the next table
+            $findCombinations(
                 $index + 1,
-                $currCombo,
-                $currCapacity
+                $currentCapacity,
+                $currentCombination
             );
         };
 
-        // Start the recursive search from the first available table with an empty combination
-        $findCombo(0, [], 0);
+        $findCombinations(0, 0, []);
 
-        return $bestCombo; // Return the best combination found
+        return $bestCombination;
     }
-}
-
 }
